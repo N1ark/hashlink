@@ -692,12 +692,29 @@ impl<K: Hash + Eq, V: Hash, S: BuildHasher> Hash for LinkedHashMap<K, V, S> {
 impl<K, V, S> Drop for LinkedHashMap<K, V, S> {
     #[inline]
     fn drop(&mut self) {
-        unsafe {
-            if let Some(values) = self.values {
-                drop_value_nodes(values);
-                let _ = Box::from_raw(values.as_ptr());
+        // Frees the guard node and the free list, also when dropping an entry panics.
+        struct FreeNodes<K, V> {
+            values: Option<NonNull<Node<K, V>>>,
+            free: Option<NonNull<Node<K, V>>>,
+        }
+
+        impl<K, V> Drop for FreeNodes<K, V> {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(values) = self.values {
+                        let _ = Box::from_raw(values.as_ptr());
+                    }
+                    drop_free_nodes(self.free);
+                }
             }
-            drop_free_nodes(self.free);
+        }
+
+        let _free_nodes = FreeNodes {
+            values: self.values,
+            free: self.free,
+        };
+        if let Some(values) = self.values {
+            unsafe { drop_value_nodes(values) };
         }
     }
 }
@@ -1811,28 +1828,35 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {}
 impl<K, V> Drop for IntoIter<K, V> {
     #[inline]
     fn drop(&mut self) {
-        for _ in 0..self.remaining {
-            unsafe {
-                let tail = self.tail.as_ptr();
-                self.tail = Some((*tail).links.value.prev);
-                (*tail).take_entry();
-                let _ = Box::from_raw(tail);
-            }
-        }
+        drop_remaining(self);
     }
 }
 
 impl<K, V> Drop for Drain<'_, K, V> {
     #[inline]
     fn drop(&mut self) {
-        for _ in 0..self.remaining {
-            unsafe {
-                let mut tail = NonNull::new_unchecked(self.tail.as_ptr());
-                self.tail = Some(tail.as_ref().links.value.prev);
-                tail.as_mut().take_entry();
-                push_free(&mut *self.free.as_ptr(), tail);
+        drop_remaining(self);
+    }
+}
+
+// Drops the remaining items of `iter`, back to front.  `IntoIter` and `Drain` release each node
+// before returning its entry, so if an entry's `Drop` panics, the guard can resume with the next
+// one while unwinding instead of leaking the rest (see `drop_value_nodes`).
+#[inline]
+fn drop_remaining<I: DoubleEndedIterator>(iter: &mut I) {
+    struct Remainder<'a, I: DoubleEndedIterator>(&'a mut I);
+
+    impl<I: DoubleEndedIterator> Drop for Remainder<'_, I> {
+        fn drop(&mut self) {
+            while let Some(item) = self.0.next_back() {
+                drop(item);
             }
         }
+    }
+
+    let rem = Remainder(iter);
+    while let Some(item) = rem.0.next_back() {
+        drop(item);
     }
 }
 
@@ -2511,14 +2535,38 @@ impl<K, V> DropFilteredValues<'_, K, V> {
 
 impl<K, V> Drop for DropFilteredValues<'_, K, V> {
     fn drop(&mut self) {
-        unsafe {
-            let end_free = self.cur_free;
-            while self.cur_free != *self.free {
-                let cur_free = self.cur_free.as_ptr();
-                (*cur_free).take_entry();
-                self.cur_free = (*cur_free).links.free.next;
+        // Hand the filtered nodes over to the free list before dropping their entries, so that
+        // they are not lost if an entry's `Drop` panics.
+        let end = mem::replace(self.free, self.cur_free);
+
+        // `Remainder` drops the entries that are left if dropping an entry panics, as in
+        // `drop_value_nodes`.
+        struct Remainder<K, V> {
+            cur: Option<NonNull<Node<K, V>>>,
+            end: Option<NonNull<Node<K, V>>>,
+        }
+
+        impl<K, V> Drop for Remainder<K, V> {
+            fn drop(&mut self) {
+                while self.cur != self.end {
+                    unsafe {
+                        let cur = self.cur.as_ptr();
+                        self.cur = (*cur).links.free.next;
+                        let _ = (*cur).take_entry();
+                    }
+                }
             }
-            *self.free = end_free;
+        }
+
+        let mut rem = Remainder {
+            cur: self.cur_free,
+            end,
+        };
+        while rem.cur != end {
+            let cur = rem.cur.as_ptr();
+            // Advance before dropping the entry, so `Remainder` resumes from the next node.
+            rem.cur = unsafe { (*cur).links.free.next };
+            drop(unsafe { (*cur).take_entry() });
         }
     }
 }

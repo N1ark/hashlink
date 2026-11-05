@@ -1017,6 +1017,81 @@ fn test_clear_panic_safe() {
     drop(map);
 }
 
+// When an entry's `Drop` panics, the remaining entries must still be dropped and no node may be
+// leaked (the latter is checked by Miri's leak detection).
+struct DropCounter {
+    drops: Rc<Cell<usize>>,
+    should_panic: Rc<Cell<bool>>,
+}
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+        if self.should_panic.replace(false) {
+            panic!("intentional panic while dropping an entry");
+        }
+    }
+}
+
+// Returns a map of three entries, the first of which to be dropped panics.
+fn panicking_drop_map(drops: &Rc<Cell<usize>>) -> LinkedHashMap<i32, DropCounter> {
+    let should_panic = Rc::new(Cell::new(true));
+    let mut map = LinkedHashMap::new();
+    for i in 0..3 {
+        map.insert(
+            i,
+            DropCounter {
+                drops: Rc::clone(drops),
+                should_panic: Rc::clone(&should_panic),
+            },
+        );
+    }
+    map
+}
+
+#[test]
+fn test_retain_panic_safe() {
+    let drops = Rc::new(Cell::new(0));
+    let mut map = panicking_drop_map(&drops);
+    assert!(catch_unwind(AssertUnwindSafe(|| map.retain(|_, _| false))).is_err());
+    assert_eq!(drops.get(), 3);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn test_retain_with_order_panic_safe() {
+    let drops = Rc::new(Cell::new(0));
+    let mut map = panicking_drop_map(&drops);
+    assert!(catch_unwind(AssertUnwindSafe(|| map.retain_with_order(|_, _| false))).is_err());
+    assert_eq!(drops.get(), 3);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn test_drain_panic_safe() {
+    let drops = Rc::new(Cell::new(0));
+    let mut map = panicking_drop_map(&drops);
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(map.drain()))).is_err());
+    assert_eq!(drops.get(), 3);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn test_into_iter_panic_safe() {
+    let drops = Rc::new(Cell::new(0));
+    let map = panicking_drop_map(&drops);
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(map.into_iter()))).is_err());
+    assert_eq!(drops.get(), 3);
+}
+
+#[test]
+fn test_drop_panic_safe() {
+    let drops = Rc::new(Cell::new(0));
+    let map = panicking_drop_map(&drops);
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(map))).is_err());
+    assert_eq!(drops.get(), 3);
+}
+
 // Regression test for https://github.com/djc/hashlink/issues/42
 //
 // A key that changes its hash/equality through interior mutability inside the
